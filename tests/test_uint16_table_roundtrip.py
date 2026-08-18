@@ -10,6 +10,9 @@ def test_uint16_table_roundtrip(tmp_path):
     expected = np.arange(n_rows, dtype=np.uint16)
 
     with TableModel((n_rows,)) as model:
+        # Keep the unrelated legacy int8/logical column away from Astropy's
+        # NULL-value path so this regression isolates unsigned integer I/O.
+        model.table["int8_column"] = np.ones(n_rows, dtype=np.int8)
         model.table["uint16_column"] = expected
         model.save(path)
         np.testing.assert_array_equal(model.table["uint16_column"], expected)
