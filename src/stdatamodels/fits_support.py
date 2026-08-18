@@ -736,14 +736,11 @@ def _load_from_schema(
             )
             if result is None and not keep_unknown:
                 return
-            if result is None and context._validate_on_assignment:
-                validate.value_change(path, result, schema, context)
-            else:
-                if context._validate_on_assignment:
-                    if validate.value_change(path, result, schema, context):
-                        properties.put_value(path, result, tree)
-                else:
+            if context._validate_on_assignment:
+                if validate.value_change(path, result, schema, context):
                     properties.put_value(path, result, tree)
+            else:
+                properties.put_value(path, result, tree)
 
         elif (
             "fits_hdu" in schema
