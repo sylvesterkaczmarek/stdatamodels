@@ -16,8 +16,7 @@ from functools import partial
 import numpy as np
 from astropy.modeling.core import Model
 from astropy.modeling.fitting import SplineSmoothingFitter
-from astropy.modeling.models import Const1D, Mapping, Rotation2D, Spline1D
-from astropy.modeling.models import math as astmath
+from astropy.modeling.models import Rotation2D, Spline1D
 from astropy.modeling.parameters import InputParameterError, Parameter
 from gwcs.spectroscopy import SellmeierGlass, SellmeierZemax, Snell3D
 from gwcs.utils import to_index
@@ -739,7 +738,7 @@ class Msa2Slit(Model):
     ----------
     slits : list
         A list of open slits.
-        A slit is a namedtuple, `~stdatamodels.jwst.transforms.models.Slit`
+        A slit is a namedtuple of type `~stdatamodels.jwst.transforms.models.Slit`
         Slit("name", "shutter_id", "dither_position", "xcen", "ycen", "ymin", "ymax",
         "quadrant", "source_id", "shutter_state", "source_name",
         "source_alias", "stellarity", "source_xpos", "source_ypos",
@@ -780,7 +779,7 @@ class Msa2Slit(Model):
         if np.iterable(self._slits[0]):
             return [Slit(*row) for row in self._slits]
         else:
-            return self.slit_ids
+            return self.sllit_ids
 
     def get_model(self, name):
         index = self.slit_ids.index(name)
@@ -809,7 +808,7 @@ class NirissSOSSModel(Model):
             Spectral orders for which there is a wavelength solution.
         models : list of :class:`astropy.modeling.core.Model`
             A list of transforms representing the wavelength solution for
-            each order in spectral orders. It should match the order in
+            each order in spectral_orders. It should match the order in
             ``spectral_orders``.
         """
         super(NirissSOSSModel, self).__init__()
@@ -1013,20 +1012,20 @@ class V2V3ToIdeal(Model):
         super(V2V3ToIdeal, self).__init__(
             v3idlyangle=v3idlyangle, v2ref=v2ref, v3ref=v3ref, vparity=vparity, name=name, **kwargs
         )
-        self.inputs = ("v2", "v3")
-        """ ('v2', 'v3'): coordinates in the telescope (V2,V3) frame."""
-        self.outputs = ("xidl", "yidl")
+        self.inputs = ("xidl", "yidl")
         """ ('xidl', 'yidl'): x and y coordinates in the telescope Ideal frame."""
+        self.outputs = ("v2", "v3")
+        """ ('v2', 'v3'): coordinates in the telescope (V2,V3) frame."""
 
     @staticmethod
-    def evaluate(v2, v3, v3idlyangle, v2ref, v3ref, vparity):
+    def evaluate(xidl, yidl, v3idlyangle, v2ref, v3ref, vparity):
         """
-        Transform from V2, V3 to Ideal telescope system.
+        Transform from Ideal to V2, V3 telescope system.
 
         Parameters
         ----------
-        v2, v3 : ndarray-like
-            Coordinates in the telescope (V2, V3) frame [in arcsec].
+        xidl, yidl : ndarray-like
+            Coordinates in Ideal System [in arcsec]
         v3idlyangle : float
             Angle between Ideal Y-axis and V3 [in deg]
         v2ref, v3ref : ndarray-like
@@ -1036,15 +1035,14 @@ class V2V3ToIdeal(Model):
 
         Returns
         -------
-        xidl, yidl : ndarray-like
-            Coordinates in the Ideal telescope system [in arcsec].
+        v2, v3 : ndarray-like
+            Coordinates in the (V2, V3) telescope system [in arcsec].
         """
         v3idlyangle = np.deg2rad(v3idlyangle)
 
-        xidl = vparity * ((v2 - v2ref) * np.cos(v3idlyangle) - (v3 - v3ref) * np.sin(v3idlyangle))
-        yidl = (v2 - v2ref) * np.sin(v3idlyangle) + (v3 - v3ref) * np.cos(v3idlyangle)
-
-        return xidl, yidl
+        v2 = v2ref + vparity * xidl * np.cos(v3idlyangle) + yidl * np.sin(v3idlyangle)
+        v3 = v3ref - vparity * xidl * np.sin(v3idlyangle) + yidl * np.cos(v3idlyangle)
+        return v2, v3
 
     def inverse(self):  # noqa: D102
         return IdealToV2V3(self.v3idlyangle, self.v2ref, self.v3ref, self.vparity)
@@ -1477,12 +1475,12 @@ class NIRCAMBackwardGrismDispersion(_BackwardGrismDispersionBase):
         x0, y0 : float or np.ndarray
             Source object x-center, y-center. If a 2-D array, it is assumed that the model
             is being called on a grid where all wavelengths are the same along the first axis,
-            and all the x,y coordinates are the same along the second axis. In this case,
+            and all the x,y coordinates are the same in the other dimension. In this case,
             x0, y0, and wavelength must all have the same shape.
         wavelength : float or np.ndarray
             Wavelength(s) in microns. If a 2-D array, it is assumed that the model
             is being called on a grid where all wavelengths are the same along the first axis,
-            and all the x,y coordinates are the same along the second axis. In this case,
+            and all the x,y coordinates are the same in the other dimension. In this case,
             x0, y0, and wavelength must all have the same shape.
 
         Returns
@@ -1721,51 +1719,51 @@ class _WFSSForwardGrismDispersion(_ForwardGrismDispersionBase):
         There's spatial dependence for NIRISS as well as dependence on the
         filter wheel rotation during the exposure.
         """
-        try:
-            iorder = self._order_mapping[int(order.flatten()[0])]
-        except KeyError as err:
-            raise ValueError("Specified order is not available") from err
+        x, y, x0, y0, order = np.broadcast_arrays(x, y, x0, y0, order)
+        wavelength = np.empty(x.shape, dtype=float)
+        t = np.linspace(0.0, 1.0, self.sampling)
+        rotate = Rotation2D(self.theta) if self.theta != 0.0 else None
+        trace_cache = {}
 
-        # The next two lines are to get around the fact that
-        # modeling.standard_broadcasting=False does not work.
-        x00 = x0.flatten()[0]
-        y00 = y0.flatten()[0]
+        for index in np.ndindex(x.shape):
+            order_value = int(order[index])
+            try:
+                iorder = self._order_mapping[order_value]
+            except KeyError as err:
+                raise ValueError("Specified order is not available") from err
 
-        t = np.linspace(0, 1, self.sampling)  # sample t
-        xmodel = self.xmodels[iorder]
-        ymodel = self.ymodels[iorder]
-        lmodel = self.lmodels[iorder]
+            source_x = x0[index]
+            source_y = y0[index]
+            cache_key = (order_value, float(source_x), float(source_y))
 
-        dx = _poly_with_spatial_dependence(t, x00, y00, xmodel)
-        dy = _poly_with_spatial_dependence(t, x00, y00, ymodel)
+            try:
+                spline, lmodel = trace_cache[cache_key]
+            except KeyError:
+                dx = _poly_with_spatial_dependence(
+                    t, source_x, source_y, self.xmodels[iorder]
+                )
+                dy = _poly_with_spatial_dependence(
+                    t, source_x, source_y, self.ymodels[iorder]
+                )
+                if rotate is not None:
+                    dx, dy = rotate(dx, dy)
 
-        if self.theta != 0.0:
-            rotate = Rotation2D(self.theta)
-            dx, dy = rotate(dx, dy)
+                alongdisp = dx if self.dispaxis == "row" else dy
+                sort_order = np.argsort(alongdisp)
+                spline = SplineSmoothingFitter()(
+                    Spline1D(), alongdisp[sort_order], t[sort_order], s=0
+                )
+                lmodel = self.lmodels[iorder]
+                trace_cache[cache_key] = (spline, lmodel)
 
-        if self.dispaxis == "row":
-            alongdisp = dx
-            mapping = Mapping((2, 3, 0, 2, 4))
-        elif self.dispaxis == "column":
-            alongdisp = dy
-            mapping = Mapping((2, 3, 1, 3, 4))
+            if self.dispaxis == "row":
+                distance = x[index] - source_x
+            else:
+                distance = y[index] - source_y
 
-        # make a lookup table for t as a function of dx
-        so = np.argsort(alongdisp)
-        # Cubic spline ensures smoothness in derivatives
-        splbase = Spline1D()
-        fitter = SplineSmoothingFitter()
-        spl = fitter(splbase, alongdisp[so], t[so], s=0)
+            wavelength[index] = np.asarray(lmodel(spline(distance))).reshape(-1)[0]
 
-        # wavelength model takes in x, x0.
-        # it then subtracts them to get dx; that's what SubtractUfunc does
-        # next it finds the t value for that dx from the lookup table, interpolating linearly
-        # finally it applies the lmodel of t to get the wavelength
-        dxr = astmath.SubtractUfunc()
-        wavelength = dxr | spl | lmodel
-        model = mapping | Const1D(x00) & Const1D(y00) & wavelength & Const1D(order)
-
-        return model(x, y, x0, y0, order)  # returns x0, y0, lambda, order
+        return x0, y0, wavelength, order
 
 
 class NIRISSForwardRowGrismDispersion(_WFSSForwardGrismDispersion):
@@ -2089,7 +2087,7 @@ class MIRIWFSSForwardDispersion(_WFSSForwardGrismDispersion):
             For MIRI WFSS we only have order = 1, so the orders is expected to equal [1,]
         lmodels : list[:class:`astropy.modeling.polynomial.Polynomial1D`]
             The forward dispersion polynomial model, such that wavelength = lmodel(t)
-            computes the wavelength from the trace parameter.
+            computes the trace parameter from the wavelength.
         xmodels : list[list[:class:`astropy.modeling.polynomial.Polynomial2D`]]
             The models encoding the x-position of the spectral trace.
             Because the shape of the trace depends on the direct-image x0, y0 position,
@@ -2205,7 +2203,7 @@ class Rotation3DToGWA(Model):
         Returns
         -------
         x, y, z : array-like
-            Rotated Cartesian coordinates
+            Rotated x,y,z coordinates
         """
         if x.shape != y.shape != z.shape:
             raise ValueError("Expected input arrays to have the same shape")
@@ -2465,9 +2463,9 @@ class WavelengthFromGratingEquation(Model):
         alpha_out : float
             The refracted angle.
         groove_density : float
-            The grating ruling density.
+            Grating ruling density.
         order : int
-            The spectral order.
+            Spectral order.
 
         Returns
         -------
