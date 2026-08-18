@@ -328,13 +328,20 @@ def _fits_array_writer(fits_context, validator, _, instance, schema, fits_hdu_ca
 
     hdu_type = _get_hdu_type(hdu_name, schema=schema, value=instance)
     hdu = _get_or_make_hdu(
-        fits_context.hdulist, hdu_name, index=index, hdu_type=hdu_type, _cache=fits_hdu_cache
+        fits_context.hdulist,
+        hdu_name,
+        index=index,
+        hdu_type=hdu_type,
+        value=instance,
+        _cache=fits_hdu_cache,
     )
 
-    # Astropy applies pseudo-unsigned integer scaling in place when writing
-    # binary-table data. Give table HDUs their own buffer so saving cannot
-    # mutate or corrupt the model's structured array.
-    hdu.data = instance.copy() if isinstance(hdu, fits.BinTableHDU) else instance
+    # When a table HDU is constructed with its data, Astropy establishes the
+    # correct ColDefs and pseudo-unsigned integer scaling (TZERO) immediately.
+    # Avoid replacing that data afterwards, which bypasses that setup and can
+    # corrupt unsigned structured columns on write.
+    if hdu.data is None:
+        hdu.data = instance
     if instance_id in fits_context.extension_array_links:
         if fits_context.extension_array_links[instance_id]() is not hdu:
             raise ValueError("Linking one array to multiple hdus is not supported")
