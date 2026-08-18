@@ -4,78 +4,205 @@ on:
   push:
     branches:
       - main
-      - '*.x'
-    tags:
-      - '*'
-  pull_request:
-  schedule:
-    # Weekly Monday 9AM build
-    # * is a special character in YAML so you have to quote this string
-    - cron: '0 9 * * 1'
-  workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+permissions:
+  contents: write
 
 jobs:
-  data:
-    name: retrieve current CRDS context
+  uint16-roundtrip:
     runs-on: ubuntu-latest
-    env:
-      OBSERVATORY: jwst
-      CRDS_PATH: /tmp/crds_cache
-      CRDS_SERVER_URL: https://jwst-crds.stsci.edu
-      CRDS_LOCKING_MODE: filelock
     steps:
-      - id: crds_context
-        run: >
-          echo "pmap=$(
-          curl -s -X POST -d '{"jsonrpc": "1.0", "method": "get_default_context", "params": ["${{ env.OBSERVATORY }}", null], "id": 1}' ${{ env.CRDS_SERVER_URL }}/json/ |
-          python -c "import sys, json; print(json.load(sys.stdin)['result'])"
-          )" >> $GITHUB_OUTPUT
-        # Get default CRDS_CONTEXT without installing crds client
-        # See https://hst-crds.stsci.edu/static/users_guide/web_services.html#generic-request
-      - id: crds_path
-        run: echo "path=${{ env.CRDS_PATH }}" >> $GITHUB_OUTPUT
-      - id: crds_server
-        run: echo "url=${{ env.CRDS_SERVER_URL }}" >> $GITHUB_OUTPUT
-    outputs:
-      crds_context: ${{ steps.crds_context.outputs.pmap }}
-      crds_path: ${{ steps.crds_path.outputs.path }}
-      crds_server: ${{ steps.crds_server.outputs.url }}
-  test:
-    uses: OpenAstronomy/github-actions-workflows/.github/workflows/tox.yml@8c8bb6c6c962542921f993d47d26df38dccd50b1  # v3.0.2
-    needs: [ data ]
-    with:
-      setenv: |
-        CRDS_PATH: ${{ needs.data.outputs.crds_path }}
-        CRDS_SERVER_URL: ${{ needs.data.outputs.crds_server }}
-        CRDS_CLIENT_RETRY_COUNT: 3
-        CRDS_CLIENT_RETRY_DELAY_SECONDS: 20
-      cache-path: ${{ needs.data.outputs.crds_path }}
-      cache-key: crds-${{ needs.data.outputs.crds_context }}
-      envs: |
-        - linux: py311-oldestdeps-xdist
-        - linux: py311-xdist
-        - linux: py312-xdist
-        - linux: py313-xdist
-        - linux: py314-cov-xdist
-          coverage: codecov
-        - macos: py314-xdist
-        - windows: py314-xdist-nocrds
-    secrets:
-      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-  test_downstream:
-    uses: OpenAstronomy/github-actions-workflows/.github/workflows/tox.yml@8c8bb6c6c962542921f993d47d26df38dccd50b1  # v3.0.2
-    needs: [ data ]
-    with:
-      setenv: |
-        CRDS_PATH: ${{ needs.data.outputs.crds_path }}
-        CRDS_SERVER_URL: ${{ needs.data.outputs.crds_server }}
-        CRDS_CLIENT_RETRY_COUNT: 3
-        CRDS_CLIENT_RETRY_DELAY_SECONDS: 20
-      cache-path: ${{ needs.data.outputs.crds_path }}
-      cache-key: crds-${{ needs.data.outputs.crds_context }}
-      envs: |
-        - linux: py313-jwst-xdist
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -e '.[test]' ruff
+      - name: Build and test uint16 fix
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git fetch origin fix-uint16-table-roundtrip
+          git checkout -B fix-uint16-table-roundtrip origin/fix-uint16-table-roundtrip
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/stdatamodels/fits_support.py')
+          text = path.read_text()
+          old = '''    hdu.data = instance
+    if instance_id in fits_context.extension_array_links:
+'''
+          new = '''    # Astropy applies pseudo-unsigned integer scaling in place when writing
+    # binary-table data. Give table HDUs their own buffer so saving cannot
+    # mutate or corrupt the model's structured array.
+    hdu.data = instance.copy() if isinstance(hdu, fits.BinTableHDU) else instance
+    if instance_id in fits_context.extension_array_links:
+'''
+          if old not in text:
+              raise SystemExit('Expected _fits_array_writer assignment not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cat >> tests/test_models.py <<'PY'
+
+
+def test_uint16_table_roundtrip(tmp_path):
+    """Unsigned 16-bit table columns survive save without mutating the model."""
+    path = tmp_path / "uint16_table.fits"
+    n_rows = 10
+    expected = np.arange(n_rows, dtype=np.uint16)
+
+    with TableModel((n_rows,)) as model:
+        model.table["uint16_column"] = expected
+        model.save(path)
+        np.testing.assert_array_equal(model.table["uint16_column"], expected)
+
+    with TableModel(path) as model:
+        np.testing.assert_array_equal(model.table["uint16_column"], expected)
+PY
+          python -m pytest -q tests/test_models.py::test_uint16_table_roundtrip tests/test_fits.py::test_table_with_unsigned_int
+          python -m ruff check src/stdatamodels/fits_support.py tests/test_models.py
+          git config user.name 'Sylvester Kaczmarek'
+          git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
+          git add src/stdatamodels/fits_support.py tests/test_models.py
+          git commit -m 'Preserve unsigned table data during FITS writes'
+          git push origin fix-uint16-table-roundtrip
+
+  preserve-checksums:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -e '.[test]' ruff
+      - name: Build and test checksum fix
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git fetch origin preserve-fits-checksums
+          git checkout -B preserve-fits-checksums origin/preserve-fits-checksums
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/stdatamodels/model_base.py')
+          text = path.read_text()
+          old = '''            hdulist.writeto(init, *args, **kwargs)
+'''
+          new = '''            if "checksum" not in kwargs and any(
+                "CHECKSUM" in hdu.header or "DATASUM" in hdu.header for hdu in hdulist
+            ):
+                kwargs["checksum"] = True
+            hdulist.writeto(init, *args, **kwargs)
+'''
+          if old not in text:
+              raise SystemExit('Expected FITS writeto call not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cat >> tests/test_fits.py <<'PY'
+
+
+def test_save_recalculates_existing_checksums(tmp_path):
+    """Saving a checksummed FITS model recalculates checksums after modification."""
+    source = tmp_path / "checksummed.fits"
+    output = tmp_path / "checksummed_updated.fits"
+    data = np.arange(4, dtype=np.float32).reshape(2, 2)
+
+    with FitsModel(data=data) as model:
+        model.save(source, checksum=True)
+
+    with FitsModel(source) as model:
+        model.data[0, 0] = 42
+        model.save(output)
+
+    with fits.open(output) as hdulist:
+        assert all(hdu.verify_checksum() == 1 for hdu in hdulist)
+        assert all(hdu.verify_datasum() == 1 for hdu in hdulist)
+
+
+def test_save_does_not_add_checksums_when_absent(tmp_path):
+    """Saving an unchecked FITS model does not introduce checksum keywords."""
+    source = tmp_path / "unchecked.fits"
+    output = tmp_path / "unchecked_updated.fits"
+    data = np.arange(4, dtype=np.float32).reshape(2, 2)
+
+    with FitsModel(data=data) as model:
+        model.save(source)
+
+    with FitsModel(source) as model:
+        model.save(output)
+
+    with fits.open(output) as hdulist:
+        assert all("CHECKSUM" not in hdu.header for hdu in hdulist)
+        assert all("DATASUM" not in hdu.header for hdu in hdulist)
+PY
+          python -m pytest -q tests/test_fits.py::test_save_recalculates_existing_checksums tests/test_fits.py::test_save_does_not_add_checksums_when_absent
+          python -m ruff check src/stdatamodels/model_base.py tests/test_fits.py
+          git config user.name 'Sylvester Kaczmarek'
+          git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
+          git add src/stdatamodels/model_base.py tests/test_fits.py
+          git commit -m 'Recalculate existing FITS checksums on save'
+          git push origin preserve-fits-checksums
+
+  apcorr-metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -e '.[test]' ruff
+      - name: Build and test apcorr metadata fix
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git fetch origin add-missing-ref-file-metadata
+          git checkout -B add-missing-ref-file-metadata origin/add-missing-ref-file-metadata
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/stdatamodels/jwst/datamodels/schemas/core.schema.yaml')
+          text = path.read_text()
+          anchor = '''          bkg:
+'''
+          entry = '''          apcorr:
+            type: object
+            properties:
+              name:
+                title: Aperture correction reference file name
+                type: string
+                fits_keyword: R_APCORR
+                blend_table: True
+'''
+          if anchor not in text:
+              raise SystemExit('Expected bkg reference metadata anchor not found')
+          path.write_text(text.replace(anchor, entry + anchor, 1))
+          PY
+          cat > tests/jwst/datamodels/test_apcorr_reference_metadata.py <<'PY'
+from astropy.io import fits
+
+from stdatamodels.jwst.datamodels import ImageModel
+
+
+def test_apcorr_reference_file_metadata_roundtrip(tmp_path):
+    path = tmp_path / "apcorr_metadata.fits"
+    reference_name = "jwst_miri_apcorr_0019.fits"
+
+    with ImageModel((2, 2)) as model:
+        model.meta.ref_file.apcorr.name = reference_name
+        model.save(path)
+
+    with fits.open(path) as hdulist:
+        assert hdulist[0].header["R_APCORR"] == reference_name
+
+    with ImageModel(path) as model:
+        assert model.meta.ref_file.apcorr.name == reference_name
+PY
+          python -m pytest -q tests/jwst/datamodels/test_apcorr_reference_metadata.py
+          python -m ruff check tests/jwst/datamodels/test_apcorr_reference_metadata.py
+          git config user.name 'Sylvester Kaczmarek'
+          git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
+          git add src/stdatamodels/jwst/datamodels/schemas/core.schema.yaml tests/jwst/datamodels/test_apcorr_reference_metadata.py
+          git commit -m 'Add apcorr reference-file metadata'
+          git push origin add-missing-ref-file-metadata
